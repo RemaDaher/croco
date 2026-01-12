@@ -219,6 +219,12 @@ class CrossAttention(nn.Module):
         self.rope = rope
         
     def forward(self, query, key, value, qpos, kpos):
+        # query → tokens from Image 1
+        # key → tokens from Image 2
+        # value → tokens from Image 2
+        # qpos → (x,y) positions of Image 1 patches
+        # kpos → (x,y) positions of Image 2 patches
+        
         B, Nq, C = query.shape
         Nk = key.shape[1]
         Nv = value.shape[1]

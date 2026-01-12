@@ -23,6 +23,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import inf
+from peft import get_peft_model_state_dict
+
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -293,8 +295,13 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
     output_dir = Path(args.output_dir)
     if fname is None: fname = str(epoch)
     checkpoint_path = output_dir / ('checkpoint-%s.pth' % fname)
+    
+    if args.use_lora:
+        model_state = get_peft_model_state_dict(model_without_ddp)
+    else:
+        model_state = model_without_ddp.state_dict()
     to_save = {
-        'model': model_without_ddp.state_dict(),
+        'model': model_state,
         'optimizer': optimizer.state_dict(),
         'scaler': loss_scaler.state_dict(),
         'args': args,
