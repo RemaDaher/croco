@@ -313,33 +313,105 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
     save_on_master(to_save, checkpoint_path)
 
 
+def _ckpt_is_adapter_only_lora(state_dict: dict) -> bool:
+    """True only when checkpoint['model'] looks like adapter-only LoRA/DoRA."""
+    if not isinstance(state_dict, dict) or len(state_dict) == 0:
+        return False
+
+    def is_lora_key(k: str) -> bool:
+        kl = k.lower()
+        return ("lora_" in kl) or ("lora_magnitude" in kl)
+
+    keys = list(state_dict.keys())
+    has_lora = any(is_lora_key(k) for k in keys)
+    if not has_lora:
+        return False
+
+    non_lora = [k for k in keys if not is_lora_key(k)]
+    return len(non_lora) == 0  # adapter-only
+
+
 def load_model(args, model_without_ddp, optimizer, loss_scaler):
     args.start_epoch = 0
     best_so_far = None
     best_pose_ate_sofar = None
-    if args.resume is not None:
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
-        print("Resume checkpoint %s" % args.resume)
-        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-        args.start_epoch = checkpoint['epoch'] + 1
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        if 'scaler' in checkpoint:
-            loss_scaler.load_state_dict(checkpoint['scaler'])
-        if 'best_so_far' in checkpoint:
-            best_so_far = checkpoint['best_so_far']
-            print(" & best_so_far={:g}".format(best_so_far))
+
+    if args.resume is None:
+        return best_so_far, best_pose_ate_sofar
+
+    # ---- load checkpoint ----
+    if args.resume.startswith("https"):
+        checkpoint = torch.hub.load_state_dict_from_url(
+            args.resume, map_location="cpu", check_hash=True
+        )
+    else:
+        checkpoint = torch.load(args.resume, map_location="cpu")
+
+    print(f"Resume checkpoint {args.resume}")
+
+    ckpt_state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+
+    use_lora = bool(getattr(args, "use_lora", False))
+    adapter_only = use_lora and _ckpt_is_adapter_only_lora(ckpt_state)
+
+    # ---- load model weights ----
+    if adapter_only:
+        # model_without_ddp must already be LoRA/PEFT-wrapped at this point
+        try:
+            from peft import set_peft_model_state_dict
+        except Exception as e:
+            raise RuntimeError(
+                "Adapter-only LoRA checkpoint detected, but 'peft' could not be imported."
+            ) from e
+
+        incompatible = set_peft_model_state_dict(model_without_ddp, ckpt_state)
+        print("[Resume] Loaded LoRA adapter weights via PEFT.")
+
+        # optional debug info (depends on PEFT version)
+        if incompatible is not None:
+            missing = getattr(incompatible, "missing_keys", [])
+            unexpected = getattr(incompatible, "unexpected_keys", [])
+            print(f"  missing_keys: {len(missing)}")
+            print(f"  unexpected_keys: {len(unexpected)}")
+            if missing:
+                print("  sample missing:", missing[:20])
+            if unexpected:
+                print("  sample unexpected:", unexpected[:20])
+
+    else:
+        msg = model_without_ddp.load_state_dict(ckpt_state, strict=False)
+        print("[Resume] Loaded model weights with torch.load_state_dict(strict=False).")
+        print(f"  missing_keys: {len(msg.missing_keys)}")
+        print(f"  unexpected_keys: {len(msg.unexpected_keys)}")
+        if msg.missing_keys:
+            print("  sample missing:", msg.missing_keys[:20])
+        if msg.unexpected_keys:
+            print("  sample unexpected:", msg.unexpected_keys[:20])
+
+    # ---- restore training state ----
+    if isinstance(checkpoint, dict):
+        if "epoch" in checkpoint:
+            args.start_epoch = checkpoint["epoch"] + 1
+
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+
+        if "scaler" in checkpoint:
+            loss_scaler.load_state_dict(checkpoint["scaler"])
+
+        if "best_so_far" in checkpoint:
+            best_so_far = checkpoint["best_so_far"]
+            print(f" & best_so_far={best_so_far:g}")
         else:
             print("")
-        if 'best_pose_ate_sofar' in checkpoint:
-            best_pose_ate_sofar = checkpoint['best_pose_ate_sofar']
-            print(" & best_pose_ate_sofar={:g}".format(best_pose_ate_sofar))
+
+        if "best_pose_ate_sofar" in checkpoint:
+            best_pose_ate_sofar = checkpoint["best_pose_ate_sofar"]
+            print(f" & best_pose_ate_sofar={best_pose_ate_sofar:g}")
         else:
             best_pose_ate_sofar = None
-        print("With optim & sched! start_epoch={:d}".format(args.start_epoch), end='')
+
+    print(f"With optim & scaler! start_epoch={args.start_epoch:d}", end="")
     return best_so_far, best_pose_ate_sofar
 
 def all_reduce_mean(x):
