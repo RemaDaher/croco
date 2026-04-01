@@ -291,6 +291,11 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
 
 
 
+def _get_qk_norm_state_dict(model):
+    """Extract all q_norm/k_norm parameters from the model."""
+    return {k: v for k, v in model.state_dict().items() if 'q_norm' in k or 'k_norm' in k}
+
+
 def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=None, best_so_far=None, best_pose_ate_sofar=None):
     output_dir = Path(args.output_dir)
     if fname is None: fname = str(epoch)
@@ -298,6 +303,10 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
     
     if args.use_lora:
         model_state = get_peft_model_state_dict(model_without_ddp)
+        # Also save qk_norm parameters alongside adapter weights
+        qk_norm_state = _get_qk_norm_state_dict(model_without_ddp)
+        if qk_norm_state:
+            model_state.update(qk_norm_state)
     else:
         model_state = model_without_ddp.state_dict()
     to_save = {
@@ -314,21 +323,21 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
 
 
 def _ckpt_is_adapter_only_lora(state_dict: dict) -> bool:
-    """True only when checkpoint['model'] looks like adapter-only LoRA/DoRA."""
+    """True only when checkpoint['model'] looks like adapter-only LoRA/DoRA (plus optional qk_norm)."""
     if not isinstance(state_dict, dict) or len(state_dict) == 0:
         return False
 
-    def is_lora_key(k: str) -> bool:
+    def is_adapter_key(k: str) -> bool:
         kl = k.lower()
-        return ("lora_" in kl) or ("lora_magnitude" in kl)
+        return ("lora_" in kl) or ("lora_magnitude" in kl) or ("q_norm" in kl) or ("k_norm" in kl)
 
     keys = list(state_dict.keys())
-    has_lora = any(is_lora_key(k) for k in keys)
+    has_lora = any(("lora_" in k.lower()) or ("lora_magnitude" in k.lower()) for k in keys)
     if not has_lora:
         return False
 
-    non_lora = [k for k in keys if not is_lora_key(k)]
-    return len(non_lora) == 0  # adapter-only
+    non_adapter = [k for k in keys if not is_adapter_key(k)]
+    return len(non_adapter) == 0  # adapter-only
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler):
@@ -364,8 +373,16 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
                 "Adapter-only LoRA checkpoint detected, but 'peft' could not be imported."
             ) from e
 
-        incompatible = set_peft_model_state_dict(model_without_ddp, ckpt_state)
+        # Separate qk_norm keys from adapter keys for loading
+        qk_norm_keys = {k: v for k, v in ckpt_state.items() if 'q_norm' in k or 'k_norm' in k}
+        adapter_keys = {k: v for k, v in ckpt_state.items() if k not in qk_norm_keys}
+
+        incompatible = set_peft_model_state_dict(model_without_ddp, adapter_keys)
         print("[Resume] Loaded LoRA adapter weights via PEFT.")
+
+        if qk_norm_keys:
+            msg = model_without_ddp.load_state_dict(qk_norm_keys, strict=False)
+            print(f"[Resume] Loaded {len(qk_norm_keys)} qk_norm parameters.")
 
         # optional debug info (depends on PEFT version)
         if incompatible is not None:
