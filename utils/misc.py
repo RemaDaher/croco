@@ -296,7 +296,10 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
     if fname is None: fname = str(epoch)
     checkpoint_path = output_dir / ('checkpoint-%s.pth' % fname)
     
-    if args.use_lora:
+    if getattr(args, 'split_norm_dora', False):
+        from dust3r.split_norm_dora import get_split_norm_dora_state_dict
+        model_state = get_split_norm_dora_state_dict(model_without_ddp)
+    elif args.use_lora:
         model_state = get_peft_model_state_dict(model_without_ddp)
     else:
         model_state = model_without_ddp.state_dict()
@@ -314,21 +317,34 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
 
 
 def _ckpt_is_adapter_only_lora(state_dict: dict) -> bool:
-    """True only when checkpoint['model'] looks like adapter-only LoRA/DoRA."""
+    """True when checkpoint['model'] looks like adapter-only LoRA/DoRA or SplitNormDoRA."""
     if not isinstance(state_dict, dict) or len(state_dict) == 0:
         return False
 
-    def is_lora_key(k: str) -> bool:
+    def is_adapter_key(k: str) -> bool:
         kl = k.lower()
-        return ("lora_" in kl) or ("lora_magnitude" in kl)
-
-    keys = list(state_dict.keys())
-    has_lora = any(is_lora_key(k) for k in keys)
-    if not has_lora:
+        # PEFT LoRA/DoRA keys
+        if ("lora_" in kl) or ("lora_magnitude" in kl):
+            return True
+        # SplitNormDoRA keys
+        if ("weight_m" in kl) or ("gamma_q" in kl) or ("gamma_k" in kl) or kl.endswith(".gamma"):
+            return True
+        # Head params saved alongside adapters
+        if "head" in kl:
+            return True
         return False
 
-    non_lora = [k for k in keys if not is_lora_key(k)]
-    return len(non_lora) == 0  # adapter-only
+    keys = list(state_dict.keys())
+    has_adapter = any(
+        ("lora_" in k.lower()) or ("lora_magnitude" in k.lower()) or
+        ("weight_m" in k) or ("gamma_q" in k) or ("gamma_k" in k)
+        for k in keys
+    )
+    if not has_adapter:
+        return False
+
+    non_adapter = [k for k in keys if not is_adapter_key(k)]
+    return len(non_adapter) == 0  # adapter-only
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler):
