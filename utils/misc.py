@@ -296,10 +296,7 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
     if fname is None: fname = str(epoch)
     checkpoint_path = output_dir / ('checkpoint-%s.pth' % fname)
     
-    if getattr(args, 'split_norm_dora', False):
-        from dust3r.split_norm_dora import get_split_norm_dora_state_dict
-        model_state = get_split_norm_dora_state_dict(model_without_ddp)
-    elif args.use_lora:
+    if args.use_lora:
         model_state = get_peft_model_state_dict(model_without_ddp)
     else:
         model_state = model_without_ddp.state_dict()
