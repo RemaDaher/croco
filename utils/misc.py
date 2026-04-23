@@ -314,7 +314,7 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
 
 
 def _ckpt_is_adapter_only_lora(state_dict: dict) -> bool:
-    """True when checkpoint['model'] looks like adapter-only LoRA/DoRA or SplitNormDoRA."""
+    """True when checkpoint['model'] looks like adapter-only LoRA/DoRA."""
     if not isinstance(state_dict, dict) or len(state_dict) == 0:
         return False
 
@@ -322,9 +322,6 @@ def _ckpt_is_adapter_only_lora(state_dict: dict) -> bool:
         kl = k.lower()
         # PEFT LoRA/DoRA keys
         if ("lora_" in kl) or ("lora_magnitude" in kl):
-            return True
-        # SplitNormDoRA keys
-        if ("weight_m" in kl) or ("gamma_q" in kl) or ("gamma_k" in kl) or kl.endswith(".gamma"):
             return True
         # Head params saved alongside adapters
         if "head" in kl:
