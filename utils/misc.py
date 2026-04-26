@@ -296,8 +296,20 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
     if fname is None: fname = str(epoch)
     checkpoint_path = output_dir / ('checkpoint-%s.pth' % fname)
     
-    if args.use_lora:
+    use_custom_dora = getattr(args, "use_custom_dora", False)
+    if args.use_lora and not use_custom_dora:
+        # PEFT LoRA/DoRA: use PEFT's adapter-only extractor
         model_state = get_peft_model_state_dict(model_without_ddp)
+    elif args.use_lora and use_custom_dora:
+        # Custom DoRA: plain nn.Module — save only trainable adapter + head.
+        # Wrapped biases are frozen (matches PEFT bias="none") so excluded.
+        full = model_without_ddp.state_dict()
+        adapter_tags = ('weight_m', 'lora_A', 'lora_B')
+        model_state = {
+            k: v for k, v in full.items()
+            if any(t in k for t in adapter_tags)
+            or 'head' in k.lower()
+        }
     else:
         model_state = model_without_ddp.state_dict()
     to_save = {
@@ -318,27 +330,31 @@ def _ckpt_is_adapter_only_lora(state_dict: dict) -> bool:
     if not isinstance(state_dict, dict) or len(state_dict) == 0:
         return False
 
-    def is_adapter_key(k: str) -> bool:
-        kl = k.lower()
-        # PEFT LoRA/DoRA keys
-        if ("lora_" in kl) or ("lora_magnitude" in kl):
-            return True
-        # Head params saved alongside adapters
-        if "head" in kl:
-            return True
-        return False
-
     keys = list(state_dict.keys())
+
+    # Step 1: Check for adapter keys
     has_adapter = any(
         ("lora_" in k.lower()) or ("lora_magnitude" in k.lower()) or
-        ("weight_m" in k) or ("gamma_q" in k) or ("gamma_k" in k)
+        ("weight_m" in k) or ("weight_v" in k)
         for k in keys
     )
     if not has_adapter:
         return False
 
+    # Step 2: If we have adapter keys, check if ALL other keys are adapter-related
+    def is_adapter_key(k: str) -> bool:
+        kl = k.lower()
+        # Adapter-specific keys
+        if ("lora_" in kl) or ("lora_magnitude" in kl) or ("weight_m" in kl) or ("weight_v" in kl):
+            return True
+        # Bias/head are OK only if we already found adapter keys (checked above)
+        if "head" in kl or "bias" in kl:
+            return True
+        # Everything else (weight, mlp, etc.) → not adapter
+        return False
+
     non_adapter = [k for k in keys if not is_adapter_key(k)]
-    return len(non_adapter) == 0  # adapter-only
+    return len(non_adapter) == 0  # adapter-only if no non-adapter keys
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler):
@@ -366,27 +382,38 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
 
     # ---- load model weights ----
     if adapter_only:
-        # model_without_ddp must already be LoRA/PEFT-wrapped at this point
-        try:
-            from peft import set_peft_model_state_dict
-        except Exception as e:
-            raise RuntimeError(
-                "Adapter-only LoRA checkpoint detected, but 'peft' could not be imported."
-            ) from e
+        use_custom_dora = getattr(args, "use_custom_dora", False)
+        if use_custom_dora:
+            # Custom DoRA: plain nn.Module — use torch's loader directly
+            msg = model_without_ddp.load_state_dict(ckpt_state, strict=False)
+            print("[Resume] Loaded custom DoRA adapter weights.")
+            print(f"  missing_keys: {len(msg.missing_keys)}")
+            print(f"  unexpected_keys: {len(msg.unexpected_keys)}")
+            if msg.missing_keys:
+                print("  sample missing:", msg.missing_keys[:20])
+            if msg.unexpected_keys:
+                print("  sample unexpected:", msg.unexpected_keys[:20])
+        else:
+            # PEFT model — use PEFT's adapter loader
+            try:
+                from peft import set_peft_model_state_dict
+            except Exception as e:
+                raise RuntimeError(
+                    "Adapter-only LoRA checkpoint detected, but 'peft' could not be imported."
+                ) from e
 
-        incompatible = set_peft_model_state_dict(model_without_ddp, ckpt_state)
-        print("[Resume] Loaded LoRA adapter weights via PEFT.")
+            incompatible = set_peft_model_state_dict(model_without_ddp, ckpt_state)
+            print("[Resume] Loaded PEFT adapter weights via PEFT.")
 
-        # optional debug info (depends on PEFT version)
-        if incompatible is not None:
-            missing = getattr(incompatible, "missing_keys", [])
-            unexpected = getattr(incompatible, "unexpected_keys", [])
-            print(f"  missing_keys: {len(missing)}")
-            print(f"  unexpected_keys: {len(unexpected)}")
-            if missing:
-                print("  sample missing:", missing[:20])
-            if unexpected:
-                print("  sample unexpected:", unexpected[:20])
+            if incompatible is not None:
+                missing = getattr(incompatible, "missing_keys", [])
+                unexpected = getattr(incompatible, "unexpected_keys", [])
+                print(f"  missing_keys: {len(missing)}")
+                print(f"  unexpected_keys: {len(unexpected)}")
+                if missing:
+                    print("  sample missing:", missing[:20])
+                if unexpected:
+                    print("  sample unexpected:", unexpected[:20])
 
     else:
         msg = model_without_ddp.load_state_dict(ckpt_state, strict=False)
@@ -497,11 +524,12 @@ def get_parameter_groups(model, weight_decay, layer_decay=1.0, skip_list=(), no_
         if not param.requires_grad:
             continue  # frozen weights
 
-        # Optionally skip LoRA parameters from layer-wise decay or apply different settings
-        if 'lora' in name.lower():
+        # Optionally skip LoRA/DoRA parameters from layer-wise decay or apply different settings
+        name_lower = name.lower()
+        if 'lora' in name_lower or 'weight_m' in name_lower or 'weight_v' in name_lower:
             group_name = 'lora'
-            this_weight_decay = 0.0  # Typically, no weight decay on LoRA parameters
-            scale = 1.0  # You might choose to have a different learning rate for LoRA parameters
+            this_weight_decay = 0.0  # Typically, no weight decay on LoRA/DoRA parameters
+            scale = 1.0  # You might choose to have a different learning rate for LoRA/DoRA parameters
         else:
             # Existing logic for base model parameters
             # Assign weight decay values
